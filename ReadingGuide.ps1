@@ -1,5 +1,5 @@
 # =====================================================================
-#  ReadingGuide.ps1  (v1)  -  an on-screen reading strip for Windows
+#  ReadingGuide.ps1  (v1.1)  -  an on-screen reading strip for Windows
 #  (c) 2026 esorhizome OU - CC BY 4.0 (creativecommons.org/licenses/by/4.0)
 # =====================================================================
 #  The digital version of laying a thin cut of paper against the line
@@ -18,6 +18,12 @@
 #       custom color, and sliders for thickness, length, horizontal
 #       position, strip opacity, and surround dim.
 #    4. Remembers your choices in "settings.json" next to this file.
+#    5. Keeps the guide visible: about twice a second a small "guard"
+#       checks that no other app's window has slid on top of the strip
+#       and that Windows hasn't hidden ("cloaked") it - and quietly
+#       fixes either. (This replaces turning "Guide on" off and on.)
+#    6. The settings panel can be dark: match Windows, always dark,
+#       always light, or light by day / dark by night.
 #
 #  What it deliberately does NOT do:
 #    - It never reads your screen. It only draws over it.
@@ -47,6 +53,7 @@
 #                    (negative = strip rides above the pointer)
 #      stepPx        how far one up/down hotkey press moves the strip
 #      panelFontSize scales the whole settings panel (7-24)
+#  (panelTheme / themeLightFrom / themeLightTo are set from the panel.)
 #
 #  Run it with "Start ReadingGuide.cmd" (same folder), or:
 #    powershell -NoProfile -Sta -ExecutionPolicy Bypass -File ReadingGuide.ps1
@@ -73,6 +80,12 @@ $Presets = @(
 $MinThick = 8;   $MaxThick = 240     # strip height, px
 $MinOp    = 5;   $MaxOp    = 90      # strip opacity, %
 $MinDim   = 10;  $MaxDim   = 85      # surround dim (band look), %
+$ThemeChoices = @(
+    @{ key = 'system'; label = 'Match Windows' },
+    @{ key = 'dark';   label = 'Always dark' },
+    @{ key = 'light';  label = 'Always light' },
+    @{ key = 'time';   label = 'By time of day' }
+)
 
 # --- Session state ---------------------------------------------------
 $script:ScriptPath   = $PSCommandPath
@@ -84,6 +97,13 @@ $script:TickN        = 0
 $script:Yf           = 0.0           # eased strip position (follow mode)
 $script:Scr          = $null         # bounds of the monitor in use
 $script:CurY         = 0
+$script:PanelDark    = $null         # theme currently painted on the panel
+$script:GuardFails   = 0             # consecutive checks that found the guide hidden
+$script:LastGuard    = [DateTime]::UtcNow
+$script:LastRebuild  = [DateTime]::MinValue
+# Windows ReadingGuide never fights for the top spot: ScreenTint's veil
+# and panel. (The strip sitting under the tint keeps both apps steady.)
+$script:Friends      = [string[]]@('ScreenTint overlay', 'ScreenTint')
 
 # Default settings (used where settings.json is missing or invalid)
 $script:S = @{
@@ -101,6 +121,9 @@ $script:S = @{
     y             = 400              # remembered manual position
     autostart     = $false
     panelFontSize = 10.5
+    panelTheme    = 'system'         # 'system' | 'dark' | 'light' | 'time'
+    themeLightFrom = 7               # 'time': light panel from this hour...
+    themeLightTo   = 19              # ...until this hour, dark otherwise
     hotkeys       = @{ toggle = 'Ctrl+Shift+F8'; follow = 'Ctrl+Shift+F10'; up = 'Ctrl+Shift+F7'; down = 'Ctrl+Shift+F6' }
 }
 
@@ -125,6 +148,52 @@ namespace ReadingGuide {
     [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
     [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr hIcon);
+    [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr hWnd, uint crKey, byte bAlpha, uint dwFlags);
+    [DllImport("dwmapi.dll")] public static extern int  DwmSetWindowAttribute(IntPtr hWnd, int attr, ref int value, int size);
+  }
+  // The guard: answers "can the user actually see this overlay right now?"
+  // Read-only questions about window order - it never reads pixels.
+  public static class Guard {
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll")] static extern IntPtr GetTopWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder s, int max);
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hWnd, int attr, out int value, int size);
+
+    // "Cloaked" = Windows keeps the window but stops drawing it (other
+    // virtual desktop, some full-screen app transitions, etc.).
+    public static bool IsCloaked(IntPtr h) {
+      try { int v; return DwmGetWindowAttribute(h, 14, out v, 4) == 0 && v != 0; } catch { return false; }
+    }
+    // 0 = fine
+    // 1 = another app's window sits on top of it (or it lost always-on-top) -> raise it
+    // 2 = hidden or cloaked -> re-show it
+    public static int Check(IntPtr me, string[] friends) {
+      if (!IsWindowVisible(me) || IsCloaked(me)) return 2;
+      if ((GetWindowLong(me, -20) & 0x8) == 0) return 1;      // WS_EX_TOPMOST lost
+      RECT m; if (!GetWindowRect(me, out m)) return 0;
+      uint myPid; GetWindowThreadProcessId(me, out myPid);
+      var sb = new System.Text.StringBuilder(64);
+      // Walk down from the very top of the window pile until we reach ourselves.
+      IntPtr w = GetTopWindow(IntPtr.Zero);
+      for (int n = 0; w != IntPtr.Zero && w != me && n < 5000; n++, w = GetWindow(w, 2)) {
+        if (!IsWindowVisible(w) || IsCloaked(w)) continue;
+        RECT r; if (!GetWindowRect(w, out r)) continue;
+        if (r.Right <= m.Left || r.Left >= m.Right || r.Bottom <= m.Top || r.Top >= m.Bottom) continue;
+        uint pid; GetWindowThreadProcessId(w, out pid);
+        if (pid == myPid) continue;                            // our own panel / dialogs
+        if (friends != null && friends.Length > 0) {
+          sb.Length = 0; GetWindowText(w, sb, 64);
+          if (Array.IndexOf(friends, sb.ToString()) >= 0) continue;
+        }
+        return 1;
+      }
+      return 0;
+    }
   }
   // Invisible message window that receives the registered hotkeys.
   public class HotkeyWindow : System.Windows.Forms.NativeWindow, IDisposable {
@@ -171,6 +240,9 @@ function Load-Settings {
         if ($null -ne $j.y)         { try { $script:S.y = [int]$j.y } catch {} }
         if ($j.autostart -is [bool]) { $script:S.autostart = $j.autostart }
         try { $f = [double]$j.panelFontSize; if ($f -ge 7 -and $f -le 24) { $script:S.panelFontSize = $f } } catch {}
+        if ($j.panelTheme -in @('system','dark','light','time')) { $script:S.panelTheme = "$($j.panelTheme)" }
+        if ($null -ne $j.themeLightFrom) { try { $script:S.themeLightFrom = Clamp ([int]$j.themeLightFrom) 0 23 } catch {} }
+        if ($null -ne $j.themeLightTo)   { try { $script:S.themeLightTo   = Clamp ([int]$j.themeLightTo)   0 24 } catch {} }
         if ($j.hotkeys) {
             foreach ($hk in @('toggle','follow','up','down')) {
                 $v = $j.hotkeys.$hk
@@ -258,12 +330,12 @@ function Move-GuideForm($f, [int]$x, [int]$y, [int]$w, [int]$h) {
     if ($w -le 0 -or $h -le 0) { $f.Visible = $false; return }
     if (-not $f.Visible) { $f.Visible = $true }
     # The form was created TopMost, so it lives in the always-on-top
-    # band for good. Move it with NOZORDER (0x4) | NOACTIVATE (0x10)
-    # rather than re-claiming the very top: other overlay apps (e.g.
-    # ScreenTint re-asserts its veil every 1.5 s) would fight back,
-    # and two windows leapfrogging reads as a slow flicker. Sitting
-    # under the tint just means the strip is tinted like the rest of
-    # the screen - steady, and consistent.
+    # band. Moving uses NOZORDER (0x4) | NOACTIVATE (0x10): ~33 moves a
+    # second must not shuffle the window pile. Staying on top is the
+    # guard's job (Guard-Guide), which re-claims the top only when some
+    # other app's window has actually slid over the strip - and never
+    # against ScreenTint, so the two never leapfrog (that would read as
+    # a slow flicker). Under the tint, the strip is simply tinted too.
     $null = [ReadingGuide.Native]::SetWindowPos($f.Handle, [IntPtr]::Zero, $x, $y, $w, $h, 0x14)
 }
 
@@ -317,6 +389,79 @@ function Apply-Guide {
     Layout-Guide (Get-CurrentY)
     Update-TrayIcon
     Sync-Ui
+}
+
+# --- Keeping the guide visible ---------------------------------------
+# Windows sometimes lets another app's always-on-top window slide over
+# the strip, or "cloaks" (stops drawing) the strip - e.g. around
+# full-screen or virtual-desktop changes. The guard spots both and
+# repairs them, so you never have to flick "Guide on" off and on.
+function Get-GuideForms {
+    @($script:Strip, $script:MaskA, $script:MaskB) | Where-Object { $_ -and -not $_.IsDisposed }
+}
+
+function Raise-Form($f) {
+    # HWND_TOPMOST = -1; NOMOVE|NOSIZE|NOACTIVATE = 0x13
+    $null = [ReadingGuide.Native]::SetWindowPos($f.Handle, [IntPtr](-1), 0, 0, 0, 0, 0x13)
+}
+
+function Reshow-Form($f) {
+    # Exactly what toggling "Guide on" did by hand: hide, show again
+    # (without taking focus), re-apply the see-through level, go on top.
+    $f.Visible = $false
+    $f.Visible = $true
+    $a = [byte][Math]::Max(0, [Math]::Min(255, [int]($f.Opacity * 255)))
+    $null = [ReadingGuide.Native]::SetLayeredWindowAttributes($f.Handle, 0, $a, 2)   # LWA_ALPHA
+    Raise-Form $f
+}
+
+function Rebuild-GuideForms {
+    # Last resort: brand-new windows, which Windows always draws on the
+    # desktop you are looking at right now.
+    $old = @(Get-GuideForms)
+    $script:Strip = New-GuideForm
+    $script:MaskA = New-GuideForm
+    $script:MaskB = New-GuideForm
+    Apply-Look
+    Layout-Guide (Get-CurrentY)
+    foreach ($f in $old) { try { $f.Close(); $f.Dispose() } catch {} }
+}
+
+function Reshow-Guide {
+    # Tray menu "Bring the guide back" - the manual version of the guard.
+    foreach ($f in Get-GuideForms) { if ($f.Visible) { Reshow-Form $f } }
+}
+
+function Guard-Guide {
+    $now = [DateTime]::UtcNow
+    # A long gap between checks means the PC slept or was locked;
+    # windows can come back from that undrawn, so refresh them once.
+    $woke = ($now - $script:LastGuard).TotalSeconds -gt 5
+    $script:LastGuard = $now
+    if (-not $script:S.enabled) { $script:GuardFails = 0; return }
+    $broken = @(); $covered = $false
+    foreach ($f in Get-GuideForms) {
+        if (-not $f.Visible) { continue }   # hidden on purpose (look / size)
+        $code = [ReadingGuide.Guard]::Check($f.Handle, $script:Friends)
+        if ($woke -or $code -eq 2) { $broken += $f }
+        elseif ($code -eq 1)       { $covered = $true }
+    }
+    if ($broken.Count -gt 0) {
+        $script:GuardFails++
+        if ($script:GuardFails -ge 3 -and ($now - $script:LastRebuild).TotalSeconds -gt 10) {
+            # Re-showing didn't stick three times running -> fresh windows.
+            $script:GuardFails = 0
+            $script:LastRebuild = $now
+            Rebuild-GuideForms
+        } else {
+            foreach ($f in $broken) { Reshow-Form $f }
+        }
+        return
+    }
+    $script:GuardFails = 0
+    if ($covered) {
+        foreach ($f in Get-GuideForms) { if ($f.Visible) { Raise-Form $f } }
+    }
 }
 
 # --- Tray icon -------------------------------------------------------
@@ -434,6 +579,105 @@ function New-GuideSlider([int]$min, [int]$max, [int]$small, [int]$large, [double
     $t
 }
 
+# --- Panel theme (light / dark) -------------------------------------
+function In-HourSpan([int]$h, [int]$from, [int]$to) {
+    # True when hour $h is inside [from, to). Handles spans that cross
+    # midnight, e.g. 20 -> 6.
+    if ($from -le $to) { ($h -ge $from) -and ($h -lt $to) }
+    else               { ($h -ge $from) -or  ($h -lt $to) }
+}
+
+function Get-WantDark {
+    # High contrast always wins: leave the panel in your chosen system
+    # colors so nothing you rely on is overridden.
+    if ([System.Windows.Forms.SystemInformation]::HighContrast) { return $false }
+    switch ($script:S.panelTheme) {
+        'dark'  { return $true }
+        'light' { return $false }
+        'time'  { return (-not (In-HourSpan (Get-Date).Hour $script:S.themeLightFrom $script:S.themeLightTo)) }
+        default {
+            # Windows' own "app mode" switch (Settings > Personalization >
+            # Colors). Reading it changes nothing.
+            try {
+                $v = [Microsoft.Win32.Registry]::GetValue(
+                    'HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize',
+                    'AppsUseLightTheme', $null)
+                return ($null -ne $v -and [int]$v -eq 0)
+            } catch { return $false }
+        }
+    }
+}
+
+function Set-ControlTheme($c, [bool]$dark, $P) {
+    if ($c.Name -eq 'swatch') { return }   # color swatches keep their color
+    if ($c -is [System.Windows.Forms.Button]) {
+        if ($dark) {
+            $c.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $c.FlatAppearance.BorderColor = $P.border
+            $c.BackColor = $P.button
+        } else {
+            $c.FlatStyle = [System.Windows.Forms.FlatStyle]::Standard
+            $c.BackColor = [System.Drawing.SystemColors]::Control
+            $c.UseVisualStyleBackColor = $true
+        }
+        $c.ForeColor = $P.fore
+    } elseif ($c -is [System.Windows.Forms.ComboBox]) {
+        $c.FlatStyle = if ($dark) { [System.Windows.Forms.FlatStyle]::Flat } else { [System.Windows.Forms.FlatStyle]::Standard }
+        $c.BackColor = $P.input; $c.ForeColor = $P.fore
+    } elseif ($c -is [System.Windows.Forms.NumericUpDown]) {
+        $c.BorderStyle = if ($dark) { [System.Windows.Forms.BorderStyle]::FixedSingle } else { [System.Windows.Forms.BorderStyle]::Fixed3D }
+        $c.BackColor = $P.input; $c.ForeColor = $P.fore
+    } elseif ($c -is [System.Windows.Forms.TrackBar]) {
+        $c.BackColor = $P.back
+    } elseif ($c -is [System.Windows.Forms.Label]) {
+        $c.ForeColor = if ($c.Name -eq 'dim') { $P.dim } else { $P.fore }
+    } else {
+        # panels, check boxes, radio buttons
+        $c.BackColor = $P.back; $c.ForeColor = $P.fore
+    }
+    foreach ($k in $c.Controls) { Set-ControlTheme $k $dark $P }
+}
+
+function Apply-PanelTheme([bool]$dark) {
+    if (-not $script:SF -or $script:SF.IsDisposed) { return }
+    if ($dark) {
+        # Same family of greys Windows 11 uses for its own dark windows.
+        $P = @{
+            back = ColorFromHex '#202020'; fore = ColorFromHex '#F0F0F0'; dim = ColorFromHex '#A8A8A8'
+            button = ColorFromHex '#2F2F2F'; border = ColorFromHex '#5C5C5C'; input = ColorFromHex '#2B2B2B'
+        }
+    } else {
+        $sc = [System.Drawing.SystemColors]
+        $P = @{
+            back = $sc::Control; fore = $sc::ControlText; dim = $sc::GrayText
+            button = $sc::Control; border = $sc::ControlDark; input = $sc::Window
+        }
+    }
+    $script:SF.SuspendLayout()
+    try {
+        $script:SF.BackColor = $P.back
+        $script:SF.ForeColor = $P.fore
+        foreach ($c in $script:SF.Controls) { Set-ControlTheme $c $dark $P }
+    } finally { $script:SF.ResumeLayout() }
+    # Dark title bar (Windows 10 20H1+ / 11): attribute 20, or 19 on
+    # older builds. FRAMECHANGED makes Windows repaint it right away.
+    $v = [int]$dark
+    try {
+        if ([ReadingGuide.Native]::DwmSetWindowAttribute($script:SF.Handle, 20, [ref]$v, 4) -ne 0) {
+            $null = [ReadingGuide.Native]::DwmSetWindowAttribute($script:SF.Handle, 19, [ref]$v, 4)
+        }
+        $null = [ReadingGuide.Native]::SetWindowPos($script:SF.Handle, [IntPtr]::Zero, 0, 0, 0, 0, 0x37)
+    } catch {}
+    $script:SF.Invalidate($true)
+    $script:PanelDark = $dark
+}
+
+function Update-PanelTheme {
+    # Cheap: repaints only when the wanted theme actually changed.
+    $want = Get-WantDark
+    if ($want -ne $script:PanelDark) { Apply-PanelTheme $want }
+}
+
 function Build-SettingsForm {
     $fs = [double]$script:S.panelFontSize
     $SF = New-Object System.Windows.Forms.Form
@@ -510,6 +754,7 @@ function Build-SettingsForm {
         $b.BackColor = ColorFromHex $pr.hex
         $tips.SetToolTip($b, $pr.name)
         $b.Tag = $pr.hex
+        $b.Name = 'swatch'
         $b.add_Click({ param($s, $e) Set-GuideColor ([string]$s.Tag) })
         $row.Controls.Add($b)
     }
@@ -537,7 +782,7 @@ function Build-SettingsForm {
     $row = New-Row
     $row.Controls.Add((New-AutoLabel 'Thickness'))
     $script:LblThick = New-AutoLabel ''
-    $script:LblThick.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $script:LblThick.Name = 'dim'
     $row.Controls.Add($script:LblThick)
     $stack.Controls.Add($row)
     $script:ThickSlider = New-GuideSlider $MinThick $MaxThick 2 10 $fs
@@ -553,7 +798,7 @@ function Build-SettingsForm {
     $row = New-Row
     $row.Controls.Add((New-AutoLabel 'Length'))
     $script:LblLen = New-AutoLabel ''
-    $script:LblLen.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $script:LblLen.Name = 'dim'
     $row.Controls.Add($script:LblLen)
     $stack.Controls.Add($row)
     $script:LenSlider = New-GuideSlider 10 100 1 10 $fs
@@ -569,7 +814,7 @@ function Build-SettingsForm {
     $row = New-Row
     $row.Controls.Add((New-AutoLabel 'Left <-> right'))
     $script:LblPos = New-AutoLabel ''
-    $script:LblPos.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $script:LblPos.Name = 'dim'
     $row.Controls.Add($script:LblPos)
     $stack.Controls.Add($row)
     $script:PosSlider = New-GuideSlider 0 100 1 10 $fs
@@ -585,7 +830,7 @@ function Build-SettingsForm {
     $row = New-Row
     $row.Controls.Add((New-AutoLabel 'Strip opacity'))
     $script:LblOp = New-AutoLabel ''
-    $script:LblOp.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $script:LblOp.Name = 'dim'
     $row.Controls.Add($script:LblOp)
     $stack.Controls.Add($row)
     $script:OpSlider = New-GuideSlider $MinOp $MaxOp 1 5 $fs
@@ -601,7 +846,7 @@ function Build-SettingsForm {
     $row = New-Row
     $row.Controls.Add((New-AutoLabel 'Surround dim (clear band)'))
     $script:LblDim = New-AutoLabel ''
-    $script:LblDim.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $script:LblDim.Name = 'dim'
     $row.Controls.Add($script:LblDim)
     $stack.Controls.Add($row)
     $script:DimSlider = New-GuideSlider $MinDim $MaxDim 1 5 $fs
@@ -612,6 +857,49 @@ function Build-SettingsForm {
         Apply-Guide
     })
     $stack.Controls.Add($script:DimSlider)
+
+    # Row: panel theme -------------------------------------------------
+    $row = New-Row
+    $row.Controls.Add((New-AutoLabel 'Panel theme:'))
+    $script:CmbTheme = New-Object System.Windows.Forms.ComboBox
+    $script:CmbTheme.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $script:CmbTheme.Width = [int]($fs * 13)
+    foreach ($t in $ThemeChoices) { $null = $script:CmbTheme.Items.Add($t.label) }
+    $tips.SetToolTip($script:CmbTheme, 'Match Windows follows your light/dark app mode; By time of day is light during the hours shown')
+    $script:CmbTheme.add_SelectedIndexChanged({
+        if ($script:UiSync -or $script:CmbTheme.SelectedIndex -lt 0) { return }
+        $script:S.panelTheme = $ThemeChoices[$script:CmbTheme.SelectedIndex].key
+        Save-Settings
+        Sync-Ui
+        Update-PanelTheme
+    })
+    $row.Controls.Add($script:CmbTheme)
+    # Hours, shown only for "By time of day"
+    $script:LblThemeFrom = New-AutoLabel 'light from'
+    $row.Controls.Add($script:LblThemeFrom)
+    $script:NumThemeFrom = New-Object System.Windows.Forms.NumericUpDown
+    $script:NumThemeFrom.Width = [int]($fs * 5); $script:NumThemeFrom.Minimum = 0; $script:NumThemeFrom.Maximum = 23
+    $script:NumThemeFrom.add_ValueChanged({
+        if ($script:UiSync) { return }
+        $script:S.themeLightFrom = [int]$script:NumThemeFrom.Value
+        Save-Settings
+        Update-PanelTheme
+    })
+    $row.Controls.Add($script:NumThemeFrom)
+    $script:LblThemeTo = New-AutoLabel 'to'
+    $row.Controls.Add($script:LblThemeTo)
+    $script:NumThemeTo = New-Object System.Windows.Forms.NumericUpDown
+    $script:NumThemeTo.Width = [int]($fs * 5); $script:NumThemeTo.Minimum = 0; $script:NumThemeTo.Maximum = 24
+    $script:NumThemeTo.add_ValueChanged({
+        if ($script:UiSync) { return }
+        $script:S.themeLightTo = [int]$script:NumThemeTo.Value
+        Save-Settings
+        Update-PanelTheme
+    })
+    $row.Controls.Add($script:NumThemeTo)
+    $byTime = ($script:S.panelTheme -eq 'time')
+    foreach ($c in @($script:LblThemeFrom, $script:NumThemeFrom, $script:LblThemeTo, $script:NumThemeTo)) { $c.Visible = $byTime }
+    $stack.Controls.Add($row)
 
     # Row: autostart ---------------------------------------------------
     $script:ChkAuto = New-Object System.Windows.Forms.CheckBox
@@ -624,11 +912,11 @@ function Build-SettingsForm {
 
     # Rows: hints ------------------------------------------------------
     $script:LblKeys = New-AutoLabel ''
-    $script:LblKeys.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $script:LblKeys.Name = 'dim'
     $stack.Controls.Add($script:LblKeys)
 
     $lblNote = New-AutoLabel 'Panel size, hotkeys, step size: edit settings.json, then tray > Reload.'
-    $lblNote.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $lblNote.Name = 'dim'
     $stack.Controls.Add($lblNote)
 
     # Closing the panel hides it; the app lives in the tray.
@@ -661,6 +949,13 @@ function Sync-Ui {
         $script:LblOp.Text    = '{0}%' -f $script:OpSlider.Value
         $script:LblDim.Text   = '{0}%' -f $script:DimSlider.Value
         $script:ChkAuto.Checked = [bool]$script:S.autostart
+        $ti = 0
+        for ($i = 0; $i -lt $ThemeChoices.Count; $i++) { if ($ThemeChoices[$i].key -eq $script:S.panelTheme) { $ti = $i } }
+        $script:CmbTheme.SelectedIndex = $ti
+        $script:NumThemeFrom.Value = Clamp ([int]$script:S.themeLightFrom) 0 23
+        $script:NumThemeTo.Value   = Clamp ([int]$script:S.themeLightTo)   0 24
+        $byTime = ($script:S.panelTheme -eq 'time')
+        foreach ($c in @($script:LblThemeFrom, $script:NumThemeFrom, $script:LblThemeTo, $script:NumThemeTo)) { $c.Visible = $byTime }
         $script:LblKeys.Text = ('Hotkeys:  {0} = on/off    {1} = follow    {2} / {3} = move' -f `
             $script:S.hotkeys.toggle, $script:S.hotkeys.follow, $script:S.hotkeys.up, $script:S.hotkeys.down)
     } finally {
@@ -669,6 +964,7 @@ function Sync-Ui {
 }
 
 function Show-Settings {
+    Update-PanelTheme           # paint the right theme before it appears
     $script:SF.Show()
     Sync-Ui
     $script:SF.Activate()
@@ -681,6 +977,7 @@ function Reload-Everything {
     $wasVisible = $script:SF -and $script:SF.Visible
     try { $script:SF.Dispose() } catch {}
     $script:SF = Build-SettingsForm
+    $script:PanelDark = $null   # new panel: theme not painted yet
     Apply-Guide
     if ($wasVisible) { Show-Settings }
 }
@@ -726,6 +1023,8 @@ try {
     $script:MenuToggle.add_Click({ Toggle-Guide })
     $script:MenuFollow = $menu.Items.Add('Follow the mouse')
     $script:MenuFollow.add_Click({ Toggle-Follow })
+    $miReshow = $menu.Items.Add('Bring the guide back')
+    $miReshow.add_Click({ Reshow-Guide })
     $miReload = $menu.Items.Add('Reload settings.json')
     $miReload.add_Click({ Reload-Everything })
     $null = $menu.Items.Add('-')
@@ -768,6 +1067,11 @@ try {
     $script:Timer.add_Tick({
         try {
             $script:TickN++
+            # ~every 0.45 s: make sure the guide is really on screen.
+            if (($script:TickN % 15) -eq 0) { Guard-Guide }
+            # ~every 2 s while the panel is open: follow theme changes
+            # (Windows light/dark switch, or the hour ticking over).
+            if (($script:TickN % 66) -eq 0 -and $script:SF -and $script:SF.Visible) { Update-PanelTheme }
             if (-not $script:S.enabled) { return }
             if ($script:S.followMouse) {
                 $pos  = [System.Windows.Forms.Cursor]::Position
@@ -790,6 +1094,7 @@ try {
             }
         } catch { }
     })
+    $script:LastGuard = [DateTime]::UtcNow
     $script:Timer.Start()
 
     # Keep the autostart entry in sync (also heals the path after the

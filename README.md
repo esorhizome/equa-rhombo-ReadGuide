@@ -24,6 +24,11 @@ things on a screen.
 - **Stays out of your way**: clicks pass straight through it, it never
   steals focus, it doesn't appear in Alt+Tab, and it is excluded from
   screenshots and screen sharing.
+- **Stays visible on its own.** About twice a second a small guard checks
+  that the strip is really on screen — that no other app's window has slid
+  over it, and that Windows hasn't quietly stopped drawing it — and fixes
+  either. No more turning *Guide on* off and on again.
+- **Light or dark settings panel** — your choice (see below).
 - Remembers your choices in `settings.json` next to the script.
 
 ## What it deliberately does NOT do
@@ -65,13 +70,45 @@ a few extra knobs — step size, follow offset, panel font size. Use the tray
 menu's *Reload settings.json* after editing. The full format is documented
 in the header of `ReadingGuide.ps1`.
 
+## Panel theme
+
+The *Panel theme* menu in the settings panel works like a navigation app's
+day/night setting:
+
+| Choice           | What the panel does                                        |
+| ---------------- | ---------------------------------------------------------- |
+| Match Windows    | follows Windows' light/dark app mode (the default)         |
+| Always dark      | dark, whatever Windows is set to                           |
+| Always light     | light, whatever Windows is set to                          |
+| By time of day   | light between the two hours you pick, dark the rest of the time |
+
+It changes live (within a couple of seconds) while the panel is open. With a
+Windows high-contrast theme on, the panel always uses your high-contrast
+colors instead.
+
+## Staying on screen
+
+Windows keeps one pile of "always on top" windows, and the last one to claim
+the top sits highest — so another app can occasionally slide over the strip,
+and around full-screen or virtual-desktop changes Windows may stop drawing it
+("cloaking"). ReadingGuide's guard watches for both about twice a second:
+
+1. another app's window covering the strip → it re-claims the top;
+2. the strip hidden or cloaked → it re-shows it (the automatic version of
+   toggling *Guide on*);
+3. still hidden after three tries → it rebuilds the strip as brand-new
+   windows, which Windows always draws on the desktop you are looking at;
+4. after sleep or lock → it refreshes the strip once.
+
+If you ever still lose it, tray → **Bring the guide back** does step 2 on
+demand.
+
 ## Plays well with overlays
 
-ReadingGuide holds a steady spot in the always-on-top band instead of
-fighting other overlay apps for the very top, so it coexists calmly with
-screen tinting tools like [ScreenTint](https://github.com/esorhizome), Night
-Light, f.lux, and friends — the strip simply gets tinted along with the rest
-of the screen.
+The guard never fights [ScreenTint](https://github.com/esorhizome/ScreenTint)
+for the top spot, so the two settle into one steady order (strip under the
+tint — it simply gets tinted along with the rest of the screen) instead of
+leapfrogging, which would look like a flicker.
 
 ## License
 
