@@ -1,6 +1,6 @@
 # =====================================================================
 #  ReadingGuide.ps1  (v1.1)  -  an on-screen reading strip for Windows
-#  (c) 2026 esorhizome OU - CC BY 4.0 (creativecommons.org/licenses/by/4.0)
+#  (c) 2026 Sarah Clemencia Gomes (esorhizome) - CC BY 4.0 (creativecommons.org/licenses/by/4.0)
 # =====================================================================
 #  The digital version of laying a thin cut of paper against the line
 #  you are reading, so your eyes never lose their place.

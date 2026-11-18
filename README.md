@@ -112,5 +112,5 @@ leapfrogging, which would look like a flicker.
 
 ## License
 
-[CC BY 4.0](LICENSE) — (c) 2026 esorhizome OU. Use it, share it, adapt it;
+[CC BY 4.0](LICENSE) — (c) 2026 Sarah Clemencia Gomes (esorhizome). Use it, share it, adapt it;
 just credit the source.
